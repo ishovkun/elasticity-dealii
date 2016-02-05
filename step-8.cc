@@ -66,72 +66,12 @@ namespace Step8
 {
   using namespace dealii;
 
-  inline
-  Tensor<2,4>	get_gassman_tensor(double lambda,double mu){
-	  Tensor<2,4> result;
-	    result[0][0] = lambda+2*mu;
-	    result[0][1] = 0;
-	    result[0][2] = 0;
-	    result[0][3] = lambda;
-	    result[1][0] = 0;
-	    result[1][1] = mu;
-	    result[1][2] = 0;
-	    result[1][3] = 0;
-	    result[2][0] = 0;
-	    result[2][1] = 0;
-	    result[2][2] = mu;
-	    result[2][3] = 0;
-	    result[3][0] = lambda;
-	    result[3][1] = 0;
-	    result[3][2] = 0;
-	    result[3][3] = lambda+2*mu;
-	    return result;
-  }
+  double E = 1e6;
+  double nu = 0.25;
+  double lambda_constand_value = E*nu/((1.+nu)*(1.-2.*nu));
+  double mu_constant_value = 0.5*E/(1+nu);
 
-
-
-  template <int dim>
-  class ElasticProblem
-  {
-  public:
-    ElasticProblem ();
-    ~ElasticProblem ();
-    void run ();
-
-  private:
-    void read_mesh();
-    void setup_system ();
-    void assemble_system ();
-    void solve ();
-    void refine_grid ();
-    void output_results (const unsigned int cycle) const;
-
-
-
-    Triangulation<dim>   triangulation;
-    DoFHandler<dim>      dof_handler;
-
-    FESystem<dim>        fe;
-
-    ConstraintMatrix     constraints;
-
-    SparsityPattern      sparsity_pattern;
-    SparseMatrix<double> system_matrix;
-
-    Vector<double>       solution;
-    Vector<double>       system_rhs;
-
-    Tensor<1,4> local_strain_tensor(FEValues<dim> &,int, int);
-
-    std::vector<unsigned int> dirichlet_boundary_labels,
-					 	 	  neumann_boundary_labels;
-    std::vector<double> dirichlet_boundary_values,
-    								 neumann_boundary_values;
-    std::vector<unsigned int> dirichlet_components,
-										   neumann_components;
-
-  };
-
+  ConstantFunction<2> lambda(lambda_constand_value), mu(mu_constant_value);
 
   template <int dim>
   class RightHandSide :  public Function<dim>
@@ -139,8 +79,7 @@ namespace Step8
   public:
     RightHandSide ();
 
-    virtual void vector_value (const Point<dim> &p,
-                               Vector<double>   &values) const;
+    virtual void vector_value (Vector<double>   &values) const;
 
     virtual void vector_value_list (const std::vector<Point<dim> > &points,
                                     std::vector<Vector<double> >   &value_list) const;
@@ -158,8 +97,7 @@ namespace Step8
 
   template <int dim>
   inline
-  void RightHandSide<dim>::vector_value (const Point<dim> &p,
-                                         Vector<double>   &values) const
+  void RightHandSide<dim>::vector_value (Vector<double>   &values) const
   {
     Assert (values.size() == dim,
             ExcDimensionMismatch (values.size(), dim));
@@ -182,18 +120,72 @@ namespace Step8
 
 
     for (unsigned int p=0; p<n_points; ++p)
-      RightHandSide<dim>::vector_value (points[p],
-                                        value_list[p]);
+      RightHandSide<dim>::vector_value (value_list[p]);
   }
 
 
+  template <int dim>
+  class ElasticProblem
+  {
+  public:
+    ElasticProblem ();
+    ~ElasticProblem ();
+    void run ();
 
+  private:
+    void read_mesh();
+    void setup_system ();
+    void assemble_system ();
+    void assemble_strain_system ();
+
+    SymmetricTensor<2,dim> local_strain_tensor(FEValues<dim> &fe_values,
+    										   const unsigned int shape_func,
+											   const unsigned int q_point);
+
+    SymmetricTensor<4,dim> get_gassman_tensor(double lambda,double mu);
+
+    void solve ();
+//    void solve_strain_system();
+    void refine_grid ();
+    void output_results (const unsigned int cycle) const;
+    void compute_derived_quantities();
+
+
+
+    Triangulation<dim>   triangulation;
+    DoFHandler<dim>      dof_handler,
+    					 dof_strain_handler;
+
+    FESystem<dim>        fe;
+    FESystem<dim>        fe_strain;
+
+    ConstraintMatrix     constraints;
+
+    SparsityPattern      sparsity_pattern,
+						 sparsity_strain_pattern;
+
+    SparseMatrix<double> system_matrix;
+    SparseMatrix<double> mass_matrix; // to compute strains
+
+    Vector<double>       solution, solution_strain,
+						 system_rhs, strain_system_rhs,
+						 sigma_xx, sigma_xy,sigma_yy;
+
+    std::vector<unsigned int> dirichlet_boundary_labels,
+					 	 	  neumann_boundary_labels,
+							  dirichlet_components,
+							  neumann_components;
+    std::vector<double> dirichlet_boundary_values,
+    					neumann_boundary_values;
+
+  };
 
   template <int dim>
-  ElasticProblem<dim>::ElasticProblem ()
-    :
+  ElasticProblem<dim>::ElasticProblem ():
     dof_handler (triangulation),
-    fe (FE_Q<dim>(1), dim)
+    dof_strain_handler (triangulation),
+    fe (FE_Q<dim>(1), dim),
+	fe_strain(FE_Q<dim>(1),dim*(dim+1)/2)
   {}
 
 
@@ -201,6 +193,7 @@ namespace Step8
   ElasticProblem<dim>::~ElasticProblem ()
   {
     dof_handler.clear ();
+    dof_strain_handler.clear ();
   }
 
   template <int dim>
@@ -215,7 +208,7 @@ namespace Step8
 	  dirichlet_components = 	  {1};
 
 	  neumann_boundary_labels = {2};
-	  neumann_boundary_values = {-2};
+	  neumann_boundary_values = {-30};
 	  neumann_components =		{1};
 
   }
@@ -224,65 +217,82 @@ namespace Step8
   void ElasticProblem<dim>::setup_system ()
   {
     dof_handler.distribute_dofs (fe);
+    dof_strain_handler.distribute_dofs (fe_strain);
 
     constraints.clear ();
     DoFTools::make_hanging_node_constraints (dof_handler,
                                              constraints);
-//    std::cout<<"Making masks"<<std::endl;
+
     std::vector<ComponentMask> displacement_masks(dim);
     for (unsigned int comp=0;comp<dim;++comp){
-//    	std::cout<<"Component "<<comp<<std::endl;
-//    	std::cout<<"Creating extractor "<<std::endl;
     	FEValuesExtractors::Scalar displacement(comp);
-//    	std::cout<<"Creating mask"<<std::endl;
     	displacement_masks[comp] = fe.component_mask(displacement);
     }
-//    std::cout<<"Making constraints"<<std::endl;
+
     unsigned int n_dirichlet_conditions = dirichlet_boundary_labels.size();
     for (unsigned int cond=0;cond<n_dirichlet_conditions;++cond){
-//    	std::cout<<"applying dirichlet constraint "<<cond<<std::endl;
     	unsigned int component = dirichlet_components[cond];
     	double dirichlet_value = dirichlet_boundary_values[cond];
     	VectorTools::interpolate_boundary_values(dof_handler,
     											 dirichlet_boundary_labels[cond],
 												 ConstantFunction<dim>(dirichlet_value,dim),
-//    	    									 constraints);
     											 constraints,
 												 displacement_masks[component]);
     }
     constraints.close ();
-    std::cout<<"done with constraints"<<std::endl;
+
     DynamicSparsityPattern dsp(dof_handler.n_dofs(), dof_handler.n_dofs());
+    DynamicSparsityPattern dsp_strain(dof_strain_handler.n_dofs(), dof_strain_handler.n_dofs());
     DoFTools::make_sparsity_pattern(dof_handler,
                                     dsp,
                                     constraints,
                                     /*keep_constrained_dofs = */ false);
+    DoFTools::make_sparsity_pattern(dof_strain_handler,
+                                    dsp_strain);
     sparsity_pattern.copy_from (dsp);
 
     system_matrix.reinit (sparsity_pattern);
 
-    solution.reinit (dof_handler.n_dofs());
-    system_rhs.reinit (dof_handler.n_dofs());
+    unsigned int n_cells = triangulation.n_active_cells();
+    unsigned int n_dofs = dof_handler.n_dofs();
+    solution.reinit (n_dofs);
+    system_rhs.reinit (n_dofs);
+    sigma_xx.reinit (n_cells);
+    sigma_xy.reinit (n_cells);
+    sigma_yy.reinit (n_cells);
   }
 
 
   template <int dim>
   inline
-//  Tensor<2,dim> ElasticProblem<dim>::local_strain_tensor()
-  Tensor<1,4> ElasticProblem<dim>::local_strain_tensor(FEValues<dim> &fe_values,
-		  	  	  	  	  	  	  	  	  	  	  	   int i,
-													   int q_point)
+  SymmetricTensor<2,dim> ElasticProblem<dim>::local_strain_tensor(FEValues<dim> &fe_values,
+		  	  	  	  	  	  	  	  	  	  	  	   	 const unsigned int shape_func,
+														 const unsigned int q_point)
   {
-	  Tensor<1,4> result;
-	  const FEValuesExtractors::Scalar u1(0);
-	  const FEValuesExtractors::Scalar u2(1);
-	  result[0] = fe_values[u1].gradient(i,q_point)[0];
-	  result[1] = 0.5*(fe_values[u1].gradient(i,q_point)[1]
-						        + fe_values[u2].gradient(i,q_point)[0]);
-	  result[2] = 0.5*(fe_values[u1].gradient(i,q_point)[1]
-						        + fe_values[u2].gradient(i,q_point)[0]);
-	  result[3] = fe_values[u2].gradient(i,q_point)[1];
-	  return result;
+	  SymmetricTensor<2,dim> tmp;
+	  tmp = 0;
+	  for (unsigned int i=0; i<dim; ++i){
+		  tmp[i][i] += fe_values.shape_grad_component(shape_func,q_point,i)[i];
+	  	  for(unsigned int j=0; j<dim;++j){
+	  		  tmp[i][j] = (fe_values.shape_grad_component(shape_func,q_point,i)[j] +
+	  				  	  	  	 fe_values.shape_grad_component(shape_func,q_point,j)[i])/2;
+	  	  }
+	  }
+	  return tmp;
+  }
+
+  template <int dim>
+  inline
+  SymmetricTensor<4,dim> ElasticProblem<dim>::get_gassman_tensor(double lambda,double mu){
+	  SymmetricTensor<4,dim> tmp;
+	  for (unsigned int i=0;i<dim;++i)
+		  for (unsigned int j=0;j<dim;++j)
+			  for (unsigned int k=0;k<dim;++k)
+				  for (unsigned int l=0;l<dim;++l)
+					  tmp[i][j][k][l] = (((i==k) && (j==l) ? mu : 0.0) +
+					  	  	  	  	  	 ((i==l) && (j==k) ? mu : 0.0) +
+										 ((i==j) && (k==l) ? lambda : 0.0));
+	  return tmp;
   }
 
   template <int dim>
@@ -311,7 +321,7 @@ namespace Step8
     std::vector<double>     lambda_values (n_q_points);
     std::vector<double>     mu_values (n_q_points);
 
-    ConstantFunction<dim> lambda(1.), mu(1.);
+
 
     RightHandSide<dim>      right_hand_side;
     std::vector<Vector<double> > rhs_values (n_q_points,
@@ -319,11 +329,11 @@ namespace Step8
 
     typename DoFHandler<dim>::active_cell_iterator cell = dof_handler.begin_active(),
                                                    endc = dof_handler.end();
-    Tensor<1,dim*dim>	strain_tensor_i;
-    Tensor<1,dim*dim>	strain_tensor_j;
-    Tensor<2,dim*dim>	gassman_tensor;
+    SymmetricTensor<2,dim>	strain_tensor_i;
+    SymmetricTensor<2,dim>	strain_tensor_j;
+    SymmetricTensor<4,dim>	gassman_tensor;
     Tensor<1,dim>	neumann_bc_vector;
-    int loop_index = 0;
+
     for (; cell!=endc; ++cell){
     	cell_matrix = 0;
         cell_rhs = 0;
@@ -348,15 +358,13 @@ namespace Step8
                     strain_tensor_i = local_strain_tensor(fe_values,i,q_point);
                     strain_tensor_j = local_strain_tensor(fe_values,j,q_point);
                 	cell_matrix(i,j) +=
-                			gassman_tensor*strain_tensor_i*strain_tensor_j*fe_values.JxW(q_point);
+                		gassman_tensor*strain_tensor_i*strain_tensor_j*fe_values.JxW(q_point);
                   }
               }
-            loop_index++;
           }
 
 
-        for (unsigned int i=0; i<dofs_per_cell; ++i)
-          {
+        for (unsigned int i=0; i<dofs_per_cell; ++i){
             const unsigned int
             component_i = fe.system_to_component_index(i).first;
 
@@ -364,9 +372,9 @@ namespace Step8
               cell_rhs(i) += fe_values.shape_value(i,q_point) *
                              rhs_values[q_point](component_i) *
                              fe_values.JxW(q_point);
-          }
+        }
         // impose neumann conditions
-        //iterate through faces
+        // iterate through faces
         for (unsigned int f=0; f<GeometryInfo<dim>::faces_per_cell;++f){
         	if (cell->face(f)->at_boundary()) {
         		unsigned int n_neumann_conditions = neumann_boundary_labels.size();
@@ -390,21 +398,72 @@ namespace Step8
         	}
         }
 
+        // impose Dirichlet conditions
         cell->get_dof_indices (local_dof_indices);
         constraints.distribute_local_to_global(cell_matrix,
         									   cell_rhs,
 											   local_dof_indices,
 											   system_matrix,
 											   system_rhs);
+
+
     }
 
 }
 
 
   template <int dim>
+  void ElasticProblem<dim>::compute_derived_quantities()
+  {
+	  QGauss<dim>  quadrature_formula(2);
+	  FEValues<dim> fe_values (fe, quadrature_formula,
+	                             update_values   | update_gradients |
+	                             update_quadrature_points | update_JxW_values);
+
+	  // we need this extractor to get FeValuesViews from FEValues,
+	  // though, we don't really extract any particular components
+	  const FEValuesExtractors::Vector displacements(0);
+
+	  const unsigned int   n_q_points    = quadrature_formula.size();
+	  std::vector<double>  lambda_values (n_q_points);
+	  std::vector<double>  mu_values (n_q_points);
+
+	  SymmetricTensor<2,dim>	strain_tensor;
+	  SymmetricTensor<2,dim>	stress_tensor;
+	  SymmetricTensor<2,dim>	temp;
+	  SymmetricTensor<4,dim>	gassman_tensor;
+	  std::vector<SymmetricTensor<2,dim>> node_strains(n_q_points);
+
+	  typename DoFHandler<dim>::active_cell_iterator cell = dof_handler.begin_active(),
+	                                                 endc = dof_handler.end();
+	  unsigned int cell_index = 0;
+
+	  for (; cell!=endc; ++cell){
+		  fe_values.reinit (cell);
+		  fe_values[displacements].get_function_symmetric_gradients(solution,node_strains);
+
+	      lambda.value_list (fe_values.get_quadrature_points(), lambda_values);
+	      mu.value_list     (fe_values.get_quadrature_points(), mu_values);
+
+          for (unsigned int q_point=0; q_point<n_q_points;++q_point){
+           	 gassman_tensor = get_gassman_tensor(lambda_values[q_point],
+           			 	 	 	 	 	 	 	 mu_values	  [q_point]);
+           	 strain_tensor = node_strains[q_point];
+           	 temp = gassman_tensor*strain_tensor;
+           	 stress_tensor = stress_tensor + temp;
+          }
+	      // Copy from local tensors to global vectors
+	      sigma_xx[cell_index] += stress_tensor[0][0]/n_q_points;
+	      sigma_xy[cell_index] += stress_tensor[0][1]/n_q_points;
+	      sigma_yy[cell_index] += stress_tensor[1][1]/n_q_points;
+	      cell_index++;
+	  }
+  }
+
+  template <int dim>
   void ElasticProblem<dim>::solve ()
   {
-    SolverControl           solver_control (1000, 1e-12); //maxiter,presicion
+    SolverControl           solver_control (1000, 1e-12); // maxiter,presicion
     SolverCG<>              cg (solver_control);
 
     PreconditionSSOR<> preconditioner;
@@ -414,7 +473,6 @@ namespace Step8
               preconditioner);
 
     constraints.distribute (solution);
-//    std::cout << neumann_boundary_values.size() << std::endl;
   }
 
 
@@ -437,13 +495,6 @@ namespace Step8
   }
 
 
-  // @sect4{ElasticProblem::output_results}
-
-  // The output happens mostly as has been shown in previous examples
-  // already. The only difference is that the solution function is vector
-  // valued. The <code>DataOut</code> class takes care of this automatically,
-  // but we have to give each component of the solution vector a different
-  // name.
   template <int dim>
   void ElasticProblem<dim>::output_results (const unsigned int cycle) const
   {
@@ -456,9 +507,6 @@ namespace Step8
 
     DataOut<dim> data_out;
     data_out.attach_dof_handler (dof_handler);
-
-
-
 
     std::vector<std::string> solution_names;
     switch (dim)
@@ -480,7 +528,15 @@ namespace Step8
       }
 
 
-    data_out.add_data_vector (solution, solution_names);
+    data_out.add_data_vector(solution, solution_names);
+    switch (dim){
+    	case 2:
+    		data_out.add_data_vector(sigma_xx,"sigma_xx");
+    		data_out.add_data_vector(sigma_xy,"sigma_xy");
+    		data_out.add_data_vector(sigma_yy,"sigma_yy");
+    }
+
+
     data_out.build_patches ();
     data_out.write_vtk (output);
   }
@@ -496,8 +552,6 @@ namespace Step8
 
         if (cycle == 0)
           {
-//            GridGenerator::hyper_cube (triangulation, -1, 1);
-//            triangulation.refine_global (2);
         	 read_mesh();
           }
         else
@@ -515,16 +569,13 @@ namespace Step8
 
         assemble_system ();
         solve ();
+        compute_derived_quantities();
         output_results (cycle);
       }
   }
 }
 
-// @sect3{The <code>main</code> function}
 
-// After closing the <code>Step8</code> namespace in the last line above, the
-// following is the main function of the program and is again exactly like in
-// step-6 (apart from the changed class names, of course).
 int main ()
 {
   try
